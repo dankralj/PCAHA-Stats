@@ -71,6 +71,7 @@ a{color:inherit}
 .field select{background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),linear-gradient(135deg,var(--muted) 50%,transparent 50%);background-position:calc(100% - 16px) 55%,calc(100% - 11px) 55%;background-size:5px 5px;background-repeat:no-repeat;padding-right:28px}
 .field.full{grid-column:1/-1}
 .field.team select{border-color:var(--accent);font-weight:600}
+.field.team{grid-column:1/-1}
 
 /* ---------- tabs ---------- */
 .tabs{display:flex;gap:4px;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:4px;position:sticky;top:8px;z-index:5;margin-bottom:14px;box-shadow:var(--shadow)}
@@ -208,7 +209,7 @@ table.stats.plog tfoot td{font-weight:700;border-top:1px solid var(--line);borde
 footer{font-size:12px;color:var(--muted);text-align:center;padding:20px 16px calc(28px + env(safe-area-inset-bottom))}
 footer a{color:var(--muted)}
 .themebtn{background:none;border:0;color:var(--muted);text-decoration:underline;cursor:pointer;font-size:12px;padding:0}
-@media (min-width:640px){.controls{grid-template-columns:1fr 1fr 1fr 1.3fr}.field.full{grid-column:auto}.field.search{grid-column:1/-1}}
+@media (min-width:640px){.controls{grid-template-columns:1fr 1fr 1fr 1.2fr 1.2fr}.field.full,.field.team{grid-column:auto}.field.search{grid-column:1/-1}}
 /* ---------- game page ---------- */
 body.detail .controls,body.detail .tabs,body.detail #summary{display:none}
 .match.tap{cursor:pointer}
@@ -265,6 +266,7 @@ body.detail .controls,body.detail .tabs,body.detail #summary{display:none}
     <div class="field"><label for="league">League</label><select id="league"></select></div>
     <div class="field"><label for="cat">Division</label><select id="cat"></select></div>
     <div class="field"><label for="sch">Schedule</label><select id="sch"></select></div>
+    <div class="field"><label for="assoc">Association</label><select id="assoc"><option value="">All associations</option></select></div>
     <div class="field team"><label for="team">My team</label><select id="team"><option value="">All teams</option></select></div>
     <div class="field full search"><label for="q">Search</label><input id="q" type="search" placeholder="Team, player, arena or game #" autocomplete="off"></div>
   </div>
@@ -323,7 +325,7 @@ const pref = {
 const S = {
   league: LEAGUES.some(l => l.key === store.get('league', 'pcaha')) ? store.get('league', 'pcaha') : 'pcaha',
   officeId: null, season: null, categories: [], schedules: [],
-  categoryId: null, scheduleId: 'all', teamId: '',
+  categoryId: null, scheduleId: 'all', teamId: '', assocId: '',
   tab: store.get('tab', 'results'),
   q: '',
   games: [], standings: {}, loadedAt: null, offline: false,
@@ -335,6 +337,7 @@ function loadPrefs() {
   S.categoryId = pref.get('categoryId', L().defaultCategory || null);
   S.scheduleId = pref.get('scheduleId', 'all');
   S.teamId = pref.get('teamId', '');
+  S.assocId = pref.get('assocId', '');
 }
 loadPrefs();
 
@@ -478,6 +481,46 @@ function restoreCache() {
   return true;
 }
 
+/* ---------- associations ---------- */
+// Every team belongs to an association (its Spordle office). Names are looked up once and kept.
+const OFFICES = store.get('assocs', {}); // officeId -> Spordle name, or '' for non-associations
+// "BURNABY MINOR HOCKEY ASSOCIATION" -> "Burnaby MHA", "NORTH SHORE WINTER CLUB" -> "North Shore Winter Club"
+const assocName = s => nameCase(String(s || '').replace(/\bMINOR HOCKEY ASSOCI?ATION\b/i, 'MHA').replace(/\bASSOCI?ATION\b/i, 'Association'))
+  .replace(/\bMha\b/g, 'MHA').replace(/'S\b/g, "'s");
+const officeOf = t => t && t.officeId && OFFICES[t.officeId] ? t.officeId : null;
+let officeFetch = null;
+async function loadOffices(ids) {
+  const todo = ids.filter(id => !(id in OFFICES));
+  if (!todo.length || officeFetch) return;
+  officeFetch = api('/offices', { where: { id: { inq: todo } } }).then(rows => {
+    for (const o of rows) OFFICES[o.id] = /association/i.test(o.type || '') ? o.name : '';
+    for (const id of todo) if (!(id in OFFICES)) OFFICES[id] = '';
+    store.set('assocs', OFFICES);
+  }).catch(() => {}).finally(() => { officeFetch = null; fillTeams(); render(); });
+}
+// Teams in the loaded division (games + standings), keyed by id
+function loadedTeams() {
+  const map = new Map();
+  for (const g of S.games) for (const t of [g.homeTeam, g.awayTeam]) if (t && !/^tba$/i.test(t.name)) map.set(t.id, t);
+  for (const rows of Object.values(S.standings)) for (const r of rows || []) if (r.team) map.set(r.team.id, r.team);
+  return map;
+}
+const assocSel = () => Number($('#assoc').value) || null;
+// ids of the picked association's teams, or null when none is picked
+function assocTeams() {
+  const a = assocSel(); if (!a) return null;
+  return new Set([...loadedTeams().values()].filter(t => t.officeId === a).map(t => t.id));
+}
+function fillAssocs(teams) {
+  const ids = [...new Set(teams.map(t => t.officeId).filter(Boolean))];
+  loadOffices(ids);
+  const opts = ids.filter(id => OFFICES[id]).sort((a, b) => assocName(OFFICES[a]).localeCompare(assocName(OFFICES[b])));
+  const sel = $('#assoc');
+  sel.replaceChildren(el('option', { value: '' }, 'All associations'), ...opts.map(id => el('option', { value: String(id) }, assocName(OFFICES[id]))));
+  // keep the saved pick even if this division has none of its teams; it applies again in another division
+  sel.value = opts.includes(Number(S.assocId)) ? String(S.assocId) : '';
+}
+
 /* ---------- selectors ---------- */
 function fillLeagues() {
   const sel = $('#league');
@@ -503,22 +546,23 @@ function fillSchedules() {
   sel.value = String(S.scheduleId);
 }
 function fillTeams() {
-  const map = new Map();
-  for (const g of S.games) for (const t of [g.homeTeam, g.awayTeam]) if (t && !/^tba$/i.test(t.name)) map.set(t.id, t);
-  for (const rows of Object.values(S.standings)) for (const r of rows || []) if (r.team) map.set(r.team.id, r.team);
-  const teams = [...map.values()].sort((a, b) => teamName(a).localeCompare(teamName(b), 'en', { numeric: true }));
+  const map = loadedTeams();
+  fillAssocs([...map.values()]);
+  const a = assocSel();
+  const teams = [...map.values()].filter(t => !a || t.officeId === a).sort((a, b) => teamName(a).localeCompare(teamName(b), 'en', { numeric: true }));
   const sel = $('#team');
   sel.replaceChildren(el('option', { value: '' }, 'All teams'), ...teams.map(t => el('option', { value: String(t.id), title: t.name }, teamName(t))));
-  if (S.teamId && !map.has(Number(S.teamId))) { /* keep preference; team may belong to another division */ sel.value = ''; }
+  if (S.teamId && !teams.some(t => t.id === Number(S.teamId))) { /* keep preference; team may belong to another division */ sel.value = ''; }
   else sel.value = String(S.teamId || '');
 }
 
 /* ---------- filtering ---------- */
 function filtered() {
   const tid = Number($('#team').value) || null;
-  const q = S.q.trim().toLowerCase();
+  const q = S.q.trim().toLowerCase(), at = assocTeams();
   return S.games.filter(g => {
     if (tid && g.homeTeamId !== tid && g.awayTeamId !== tid) return false;
+    if (at && !at.has(g.homeTeamId) && !at.has(g.awayTeamId)) return false;
     if (!q) return true;
     const v = g.surface && g.surface.venue;
     return [g.number, g.id, g.homeTeam && g.homeTeam.name, g.homeTeam && g.homeTeam.shortName, g.awayTeam && g.awayTeam.name,
@@ -653,12 +697,12 @@ function gameCard(g) {
 }
 
 function renderStandings() {
-  const tid = Number($('#team').value) || null;
-  const scheds = schedulesForCategory().filter(s => S.standings[s.id] && S.standings[s.id].length);
-  if (!scheds.length) return el('div', { class: 'empty' }, 'No standings available yet.');
+  const tid = Number($('#team').value) || null, at = assocTeams();
+  const scheds = schedulesForCategory().filter(s => S.standings[s.id] && S.standings[s.id].some(r => !at || at.has(r.teamId)));
+  if (!scheds.length) return el('div', { class: 'empty' }, at ? 'No standings for this association’s teams yet.' : 'No standings available yet.');
   const frag = document.createDocumentFragment();
   for (const s of scheds.slice().reverse()) {
-    const rows = S.standings[s.id].slice().sort((a, b) =>
+    const rows = S.standings[s.id].filter(r => !at || at.has(r.teamId)).sort((a, b) =>
       (a.manualRanking ?? a.ranking ?? 999) - (b.manualRanking ?? b.ranking ?? 999) || (b.points - a.points));
     frag.append(el('div', { class: 'sched-h' }, s.name),
       el('div', { class: 'tablewrap' }, el('table', {},
@@ -862,6 +906,8 @@ function renderStats() {
   const q = S.q.trim().toLowerCase();
   let rows = statRows(d, mode);
   if (S.statMine && tid && !past) rows = rows.filter(r => r.team === tid); // team ids change every season
+  const at = past ? null : assocTeams();
+  if (at) rows = rows.filter(r => at.has(r.team));
   if (q) rows = rows.filter(r => [r.name, teamOf(r.team), (d.teams[r.team] || [])[0], r.num].some(x => x != null && String(x).toLowerCase().includes(q)));
   rows = sortStats(rows, mode);
 
@@ -1255,12 +1301,13 @@ function onTeam() { S.teamId = $('#team').value; pref.set('teamId', S.teamId); S
 
 $('#league').addEventListener('change', e => {
   S.league = e.target.value; store.set('league', S.league); loadPrefs(); S.statSeason = '';
-  S.shown = PAGE_SIZE; $('#team').replaceChildren(el('option', { value: '' }, 'All teams'));
+  S.shown = PAGE_SIZE; $('#team').replaceChildren(el('option', { value: '' }, 'All teams')); $('#assoc').replaceChildren(el('option', { value: '' }, 'All associations'));
   boot();
 });
 $('#cat').addEventListener('change', e => { S.categoryId = e.target.value; pref.set('categoryId', S.categoryId); S.scheduleId = 'all'; pref.set('scheduleId', 'all'); fillSelectors(); S.games = []; loadGames(); });
 $('#sch').addEventListener('change', e => { S.scheduleId = e.target.value; pref.set('scheduleId', S.scheduleId); loadGames(); });
 $('#team').addEventListener('change', () => { onTeam(); render(); });
+$('#assoc').addEventListener('change', e => { S.assocId = e.target.value; pref.set('assocId', S.assocId); S.shown = PAGE_SIZE; fillTeams(); onTeam(); render(); });
 $('#q').addEventListener('input', e => { S.q = e.target.value; S.shown = PAGE_SIZE; render(); });
 $('#refresh').addEventListener('click', () => { for (const k of Object.keys(STATS)) if (k.startsWith(S.league + '|')) delete STATS[k]; return S.schedules.length ? loadGames() : boot(); });
 document.querySelectorAll('.tabs button').forEach(b => b.addEventListener('click', () => { S.tab = b.dataset.tab; store.set('tab', S.tab); S.shown = PAGE_SIZE; render(); }));
