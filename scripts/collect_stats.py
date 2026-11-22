@@ -216,9 +216,12 @@ def store_game(db, gid, stats, lineups, box=None):
                (datetime.now(timezone.utc).isoformat(), has, gid))
 
 
-def sync_league(db, lg, full=False):
+def current_season(lg):
     seasons = api(f"/seasons?officeId={lg['officeId']}")
-    season = next((s for s in seasons if s.get('isCurrent')), seasons[0])['seasonId']
+    return next((s for s in seasons if s.get('isCurrent')), seasons[0])['seasonId']
+
+
+def sync_league(db, lg, season, full=False):
     cats = api(f"/categories?officeId={lg['officeId']}&seasonId={season}")
     scheds = api(f"/schedules?officeId={lg['officeId']}&seasonId={season}")
     for c in cats:
@@ -260,7 +263,7 @@ def sync_league(db, lg, full=False):
             db.execute(f'DELETE FROM {t} WHERE {"id" if t == "games" else "game_id"}=?', (gid,))
     db.commit()
 
-    log(f"{lg['name']}: {len(games)} games, {len(todo)} to fetch")
+    log(f"{lg['name']} {season}: {len(games)} games, {len(todo)} to fetch")
     errors = 0
     with ThreadPoolExecutor(WORKERS) as ex:
         for n, fut in enumerate([ex.submit(fetch_game, gid) for gid in todo], 1):
@@ -273,10 +276,10 @@ def sync_league(db, lg, full=False):
                 db.commit()
                 log(f'  {n}/{len(todo)}')
     db.commit()
-    return season, errors
+    return errors
 
 
-def export_league(db, lg, season, out_dir):
+def export_league(db, lg, season, out_dir, current=False):
     q = lambda sql, *a: db.execute(sql, a).fetchall()
     key = lg['key']
     skaters = q("""
@@ -295,29 +298,65 @@ def export_league(db, lg, season, out_dir):
     team_ids = {r[3] for r in skaters} | {r[3] for r in goalies}
     teams = {str(r[0]): [r[1], r[2]] for r in q('SELECT id,name,short_name FROM teams') if r[0] in team_ids}
     scheds = {str(r[0]): [r[1], r[2], r[3]] for r in q('SELECT id,category_id,name,type FROM schedules WHERE league=? AND season=?', key, season)}
+    cat_ids = {v[0] for v in scheds.values()}
+    cats = {r[0]: r[1] for r in q('SELECT id,name FROM categories WHERE league=?', key) if r[0] in cat_ids}
+    # every season with stats, newest first, so the app can offer a season picker
+    seasons = [r[0] for r in q('SELECT DISTINCT season FROM games WHERE league=? AND has_stats=1 ORDER BY season DESC', key)]
     games_done = q('SELECT COUNT(*), SUM(has_stats) FROM games WHERE league=? AND season=? AND fetched_at IS NOT NULL', key, season)[0]
     data = {
         'version': 1,
         'league': key,
         'season': season,
+        'seasons': seasons,
         'generatedAt': datetime.now(timezone.utc).isoformat(timespec='seconds'),
         'games': games_done[0] or 0,
         'gamesWithStats': games_done[1] or 0,
         'teams': teams,                 # id -> [name, shortName]
         'schedules': scheds,            # id -> [categoryId, name, type]
+        'categories': cats,             # id -> division name
         # one row per player per team per schedule; the app adds up the schedules being viewed
         'skaterCols': ['id', 'name', 'num', 'team', 'sched', 'gp', 'g', 'a', 'pts', 'pim', 'ppg', 'shg', 'gwg'],
         'skaters': [list(r) for r in skaters],
         'goalieCols': ['id', 'name', 'num', 'team', 'sched', 'gp', 'w', 'l', 't', 'ga', 'min', 'so'],
         'goalies': [list(r) for r in goalies],
     }
+    if not current and not (games_done[1] or 0):
+        log(f"{lg['name']} {season}: no game sheets, nothing written")
+        return
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, f'stats-{key}.json')
+    # stats-<league>-<season>.json for every season; stats-<league>.json is the current one
+    names = [f'stats-{key}-{season}.json'] + ([f'stats-{key}.json'] if current else [])
+    for name in names:
+        path = os.path.join(out_dir, name)
+        tmp = path + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(data, f, separators=(',', ':'))
+        os.replace(tmp, path)  # atomic, so the site never reads a half-written file
+    log(f"{lg['name']} {season}: wrote {', '.join(names)} ({len(skaters)} skater rows, {len(goalies)} goalie rows)")
+
+
+def backup(db, folder, keep_daily=14, keep_monthly=12):
+    """One snapshot a day (stats-YYYY-MM-DD.db); keeps the last 14 days plus the first of each of the last 12 months."""
+    folder = os.path.expanduser(folder)
+    os.makedirs(folder, exist_ok=True)
+    today = datetime.now().strftime('%Y-%m-%d')
+    path = os.path.join(folder, f'stats-{today}.db')
+    if os.path.exists(path):
+        return
     tmp = path + '.tmp'
-    with open(tmp, 'w') as f:
-        json.dump(data, f, separators=(',', ':'))
-    os.replace(tmp, path)  # atomic, so the site never reads a half-written file
-    log(f"{lg['name']}: wrote {path} ({len(skaters)} skater rows, {len(goalies)} goalie rows)")
+    dst = sqlite3.connect(tmp)
+    db.backup(dst)  # consistent copy even while the database is in use
+    dst.close()
+    os.replace(tmp, path)
+    snaps = sorted(f for f in os.listdir(folder) if f.startswith('stats-') and f.endswith('.db'))
+    monthly = {}
+    for f in snaps:
+        monthly.setdefault(f[6:13], f)  # first snapshot of each month
+    keep = set(snaps[-keep_daily:]) | set(sorted(monthly.values())[-keep_monthly:])
+    for f in snaps:
+        if f not in keep:
+            os.remove(os.path.join(folder, f))
+    log(f'backup: {path} ({len(keep)} kept)')
 
 
 def main():
@@ -326,6 +365,8 @@ def main():
     ap.add_argument('--out', default=DEFAULT_OUT, help='folder for stats-<league>.json')
     ap.add_argument('--league', action='append', help='only these league keys (default: all)')
     ap.add_argument('--full', action='store_true', help='re-fetch every finished game')
+    ap.add_argument('--backup-dir', help='also keep a daily snapshot of the database here')
+    ap.add_argument('--season', action='append', help='season(s) to sync, e.g. 2025-26 (default: the current one)')
     args = ap.parse_args()
 
     db = open_db(args.db)
@@ -334,11 +375,21 @@ def main():
         if args.league and lg['key'] not in args.league:
             continue
         try:
-            season, errors = sync_league(db, lg, args.full)
-            export_league(db, lg, season, args.out)
-            failed |= errors > 0
+            cur = current_season(lg)
+            for season in args.season or [cur]:
+                errors = sync_league(db, lg, season, args.full)
+                export_league(db, lg, season, args.out, current=season == cur)
+                failed |= errors > 0
+            if args.season and cur not in args.season:
+                export_league(db, lg, cur, args.out, current=True)  # refresh its list of seasons
         except Exception as e:
             log(f"{lg['name']}: FAILED - {e}")
+            failed = True
+    if args.backup_dir:
+        try:
+            backup(db, args.backup_dir)
+        except Exception as e:
+            log('backup FAILED -', e)
             failed = True
     sys.exit(1 if failed else 0)
 
