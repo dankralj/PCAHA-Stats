@@ -694,6 +694,9 @@ S.statSort = store.get('statSort', { skaters: { k: 'pts', dir: -1 }, goalies: { 
 S.statMine = store.get('statMine', false);
 S.statSeason = '';                       // '' = current season; a past one like '2024-25'
 S.statPast = { cat: null, type: 'all' }; // division + stage picked while viewing a past season
+S.statType = 'all';                      // stage picked for the current season (League, Tournament, ...)
+// Spordle's "Exhibition" schedules are pre-season games
+const stageLabel = t => t === 'Exhibition' ? 'Pre-season / exhibition' : t;
 
 const statsKey = () => S.league + '|' + S.statSeason;
 async function loadStatsFile(league, season) {
@@ -740,7 +743,11 @@ function pastCategory(d) {
   return (match || opts[0] || {}).id;
 }
 function statScheds(d) {
-  if (!S.statSeason) return new Set((S.scheduleId === 'all' ? schedulesForCategory().map(s => s.id) : [S.scheduleId]).map(String));
+  if (!S.statSeason) {
+    const ids = (S.scheduleId === 'all' ? schedulesForCategory().map(s => s.id) : [S.scheduleId]).map(String);
+    const type = curStage(d, ids);
+    return new Set(type === 'all' ? ids : ids.filter(id => ((d.schedules[id] || [])[2] || 'Other') === type));
+  }
   const cat = pastCategory(d);
   return new Set(Object.entries(d.schedules)
     .filter(([, [c, , type]]) => c === cat && (S.statPast.type === 'all' || (type || 'Other') === S.statPast.type)).map(([id]) => id));
@@ -814,6 +821,21 @@ function seasonPicker(d) {
   sel.value = S.statSeason || cur.season;
   return sel;
 }
+// Stages present among the current season's selected schedules
+function curStages(d, ids) {
+  const used = new Set([...d.skaters, ...d.goalies].map(r => String(r[4])));
+  return [...new Set(ids.filter(id => used.has(id) && d.schedules[id]).map(id => d.schedules[id][2] || 'Other'))].sort();
+}
+function curStage(d, ids) { return curStages(d, ids).includes(S.statType) ? S.statType : 'all'; }
+function curStagePicker(d) {
+  if (S.scheduleId !== 'all') return ''; // a single schedule is already one stage
+  const ids = schedulesForCategory().map(x => String(x.id)), types = curStages(d, ids);
+  if (types.length < 2) return '';
+  const sel = el('select', { 'aria-label': 'Stage', onchange: e => { S.statType = e.target.value; S.shown = PAGE_SIZE; render(); } },
+    el('option', { value: 'all' }, 'All games'), ...types.map(t => el('option', { value: t }, stageLabel(t))));
+  sel.value = curStage(d, ids);
+  return sel;
+}
 function pastPickers(d) {
   const opts = pastOptions(d), cat = pastCategory(d), o = opts.find(x => x.id === cat);
   if (!o) return [];
@@ -824,7 +846,7 @@ function pastPickers(d) {
   if (!o.types.includes(S.statPast.type)) S.statPast.type = 'all';
   const stage = el('select', { 'aria-label': 'Stage',
     onchange: e => { S.statPast.type = e.target.value; S.shown = PAGE_SIZE; render(); } },
-    el('option', { value: 'all' }, 'All games'), ...o.types.map(t => el('option', { value: t }, t)));
+    el('option', { value: 'all' }, 'All games'), ...o.types.map(t => el('option', { value: t }, stageLabel(t))));
   stage.value = S.statPast.type;
   return [div, o.types.length > 1 ? stage : ''];
 }
@@ -849,7 +871,7 @@ function renderStats() {
       el('button', { 'aria-pressed': String(mode === 'skaters'), onclick: () => setMode('skaters') }, 'Players'),
       el('button', { 'aria-pressed': String(mode === 'goalies'), onclick: () => setMode('goalies') }, 'Goalies')),
     seasonPicker(d),
-    ...(past ? pastPickers(d) : []),
+    ...(past ? pastPickers(d) : [curStagePicker(d)]),
     tid && !past ? el('button', { class: 'chip', 'aria-pressed': String(!!S.statMine),
       onclick: () => { S.statMine = !S.statMine; store.set('statMine', S.statMine); S.shown = PAGE_SIZE; render(); } }, 'My team only') : '');
 
@@ -940,7 +962,7 @@ function renderPlayer(pid) {
       el('button', { 'aria-pressed': String(goalie), onclick: () => { pv.mode = 'goalie'; render(); } }, 'Goalie')) : '',
     stages.length > 1 ? (() => {
       const sel = el('select', { 'aria-label': 'Games', onchange: e => { pv.stage = e.target.value; render(); } },
-        el('option', { value: 'all' }, 'All games'), ...stages.map(x => el('option', { value: x }, x)));
+        el('option', { value: 'all' }, 'All games'), ...stages.map(x => el('option', { value: x }, stageLabel(x))));
       sel.value = pv.stage; return sel;
     })() : '');
 
@@ -1048,7 +1070,7 @@ function renderTeam(rt) {
   const controls = el('div', { class: 'statbar' },
     stages.length > 1 ? (() => {
       const sel = el('select', { 'aria-label': 'Games', onchange: e => { tv.stage = e.target.value; render(); } },
-        el('option', { value: 'all' }, 'All games'), ...stages.map(x => el('option', { value: x }, x)));
+        el('option', { value: 'all' }, 'All games'), ...stages.map(x => el('option', { value: x }, stageLabel(x))));
       sel.value = tv.stage; return sel;
     })() : '',
     inList ? el('button', { class: 'chip', onclick: () => {
