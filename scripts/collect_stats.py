@@ -15,6 +15,7 @@ Run it from cron, e.g. every 30 minutes:
 """
 import argparse
 import json
+import re
 import os
 import sqlite3
 import sys
@@ -296,7 +297,7 @@ def export_league(db, lg, season, out_dir, current=False):
         WHERE g.league=? AND g.season=?
         GROUP BY gg.player_id, gg.team_id, g.schedule_id""", key, season)
     team_ids = {r[3] for r in skaters} | {r[3] for r in goalies}
-    teams = {str(r[0]): [r[1], r[2]] for r in q('SELECT id,name,short_name FROM teams') if r[0] in team_ids}
+    teams = {str(r[0]): [r[1], useful_short(r[1], r[2])] for r in q('SELECT id,name,short_name FROM teams') if r[0] in team_ids}
     scheds = {str(r[0]): [r[1], r[2], r[3]] for r in q('SELECT id,category_id,name,type FROM schedules WHERE league=? AND season=?', key, season)}
     cat_ids = {v[0] for v in scheds.values()}
     cats = {r[0]: r[1] for r in q('SELECT id,name FROM categories WHERE league=?', key) if r[0] in cat_ids}
@@ -335,6 +336,91 @@ def export_league(db, lg, season, out_dir, current=False):
     log(f"{lg['name']} {season}: wrote {', '.join(names)} ({len(skaters)} skater rows, {len(goalies)} goalie rows)")
 
 
+PLAYER_SHARDS = 1024
+
+# Some teams' Spordle short name is only their division ("U13 A1", "U13 T2-A1"),
+# which doesn't say which club it is; use the full name for those.
+_DIVISION_ONLY = re.compile(r'^\s*(U\d+|\d+U)\b[\s\w-]*$', re.I)
+
+
+def useful_short(name, short):
+    if not short or (_DIVISION_ONLY.match(short) and not re.search(r'[a-z]{4,}', short, re.I)):
+        return None
+    return short
+
+
+
+def export_players(db, out_dir):
+    """stats/players/<id % 1024>.json: every player's seasons and game log, across leagues and seasons.
+
+    A player page loads just the one file holding that player. Files whose
+    contents haven't changed are left alone.
+    """
+    t0 = time.time()
+    db.execute('PRAGMA busy_timeout = 30000')
+    teams = {r[0]: useful_short(r[1], r[2]) or r[1] for r in db.execute('SELECT id, name, short_name FROM teams')}
+    names = dict(db.execute('SELECT id, full_name FROM players'))
+    shards = [dict() for _ in range(PLAYER_SHARDS)]
+
+    def player(pid):
+        sh = shards[pid % PLAYER_SHARDS]
+        if pid not in sh:
+            sh[pid] = {'name': names.get(pid) or '', 'skater': [], 'goalie': [], 'log': [], 'glog': []}
+        return sh[pid]
+
+    # rows hold team ids; each file carries the names of the teams it mentions
+    short = lambda t: (t or '')[:16] + 'Z' if t else t  # 2025-10-04T17:15Z
+
+    base = """FROM {t} x JOIN games g ON g.id = x.game_id
+              LEFT JOIN schedules s ON s.id = g.schedule_id LEFT JOIN categories c ON c.id = g.category_id"""
+    # season rows: [league, season, division, stage, team, number, gp, ...totals]
+    for r in db.execute(f"""SELECT x.player_id, g.league, g.season, c.name, s.type, x.team_id, MAX(x.number),
+                                   COUNT(*), SUM(goals), SUM(assists), SUM(points), SUM(pim)
+                            {base.format(t='skater_games')} GROUP BY 1,2,3,4,5,6"""):
+        player(r[0])['skater'].append([r[1], r[2], r[3], r[4], r[5], *r[6:]])
+    for r in db.execute(f"""SELECT x.player_id, g.league, g.season, c.name, s.type, x.team_id, MAX(x.number),
+                                   COUNT(*), SUM(result='win'), SUM(result='loss'), SUM(result='tie'),
+                                   SUM(goals_against), ROUND(SUM(minutes),1), SUM(shutout)
+                            {base.format(t='goalie_games')} GROUP BY 1,2,3,4,5,6"""):
+        player(r[0])['goalie'].append([r[1], r[2], r[3], r[4], r[5], *r[6:]])
+    # game logs: [gameId, start, league, season, stage, team, opponent, home, team score, opp score, ...line]
+    side = """x.team_id = g.home_team_id,
+              CASE WHEN x.team_id = g.home_team_id THEN g.away_team_id ELSE g.home_team_id END,
+              CASE WHEN x.team_id = g.home_team_id THEN g.home_score ELSE g.away_score END,
+              CASE WHEN x.team_id = g.home_team_id THEN g.away_score ELSE g.home_score END"""
+    for r in db.execute(f"""SELECT x.player_id, g.id, g.start_time, g.league, g.season, s.type, x.team_id, {side},
+                                   goals, assists, pim
+                            {base.format(t='skater_games')} ORDER BY g.start_time"""):
+        player(r[0])['log'].append([r[1], short(r[2]), r[3], r[4], r[5], r[6], r[8], r[7], *r[9:]])
+    for r in db.execute(f"""SELECT x.player_id, g.id, g.start_time, g.league, g.season, s.type, x.team_id, {side},
+                                   goals_against, minutes, result
+                            {base.format(t='goalie_games')} ORDER BY g.start_time"""):
+        player(r[0])['glog'].append([r[1], short(r[2]), r[3], r[4], r[5], r[6], r[8], r[7], *r[9:]])
+
+    folder = os.path.join(out_dir, 'players')
+    os.makedirs(folder, exist_ok=True)
+    written = 0
+    for i, sh in enumerate(shards):
+        used = set()
+        for pl in sh.values():
+            used.update(r[4] for r in pl['skater'] + pl['goalie'])
+            used.update(x for r in pl['log'] + pl['glog'] for x in (r[5], r[6]))
+        body = json.dumps({'v': 1, 'teams': {str(t): teams.get(t, '') for t in sorted(x for x in used if x)},
+                           'players': {str(k): v for k, v in sorted(sh.items())}}, separators=(',', ':')).encode()
+        path = os.path.join(folder, f'{i}.json')
+        try:
+            with open(path, 'rb') as f:
+                if f.read() == body:
+                    continue
+        except FileNotFoundError:
+            pass
+        with open(path + '.tmp', 'wb') as f:
+            f.write(body)
+        os.replace(path + '.tmp', path)
+        written += 1
+    log(f'players: {sum(len(s) for s in shards)} players, {written} of {PLAYER_SHARDS} files updated ({time.time() - t0:.1f}s)')
+
+
 def backup(db, folder, keep_daily=14, keep_monthly=12):
     """One snapshot a day (stats-YYYY-MM-DD.db); keeps the last 14 days plus the first of each of the last 12 months."""
     folder = os.path.expanduser(folder)
@@ -365,11 +451,16 @@ def main():
     ap.add_argument('--out', default=DEFAULT_OUT, help='folder for stats-<league>.json')
     ap.add_argument('--league', action='append', help='only these league keys (default: all)')
     ap.add_argument('--full', action='store_true', help='re-fetch every finished game')
+    ap.add_argument('--no-players', action='store_true', help='skip writing the per-player files')
+    ap.add_argument('--players-only', action='store_true', help='only write the per-player files from the database')
     ap.add_argument('--backup-dir', help='also keep a daily snapshot of the database here')
     ap.add_argument('--season', action='append', help='season(s) to sync, e.g. 2025-26 (default: the current one)')
     args = ap.parse_args()
 
     db = open_db(args.db)
+    if args.players_only:
+        export_players(db, args.out)
+        return
     failed = False
     for lg in LEAGUES:
         if args.league and lg['key'] not in args.league:
@@ -384,6 +475,12 @@ def main():
                 export_league(db, lg, cur, args.out, current=True)  # refresh its list of seasons
         except Exception as e:
             log(f"{lg['name']}: FAILED - {e}")
+            failed = True
+    if not args.no_players:
+        try:
+            export_players(db, args.out)
+        except Exception as e:
+            log('players export FAILED -', e)
             failed = True
     if args.backup_dir:
         try:

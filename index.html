@@ -175,6 +175,23 @@ table.stats .pn{font-weight:600}
 table.stats .pn small{color:var(--muted);font-weight:500;margin-left:4px}
 table.stats .tm{display:block;font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px}
 table.stats td.sorted{font-weight:700;color:var(--accent)}
+a.pn{text-decoration:none}
+a.pn:hover{text-decoration:underline;color:var(--accent)}
+.phead{display:flex;align-items:center;gap:14px}
+.phead .jersey{flex:none;width:58px;height:58px;border-radius:16px;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;font-family:var(--display);font-size:28px;font-weight:700}
+.phead .pname{font-family:var(--display);font-size:30px;font-weight:700;letter-spacing:.4px;line-height:1.05}
+.phead .psub{color:var(--muted);font-size:14px;margin-top:4px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(54px,1fr));gap:8px}
+.tile{background:var(--surface-2);border-radius:12px;padding:10px 4px 8px;text-align:center;min-width:0}
+.tile b{display:block;font-family:var(--display);font-size:28px;line-height:1.05;font-variant-numeric:tabular-nums}
+.tile span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;font-weight:700}
+.tile.hi b{color:var(--accent)}
+.section .statbar{margin:0 0 12px}
+table.stats.plog tbody tr.go{cursor:pointer}
+table.stats.plog tr.sel td{background:var(--accent-soft)}
+table.stats.plog td.res{font-weight:700}
+table.stats.plog td.res.W{color:var(--win)}table.stats.plog td.res.L{color:var(--loss)}table.stats.plog td.res.T{color:var(--tie)}
+table.stats.plog tfoot td{font-weight:700;border-top:1px solid var(--line);border-bottom:0}
 .statnote{font-size:12px;color:var(--muted);text-align:center;margin:-4px 8px 16px}
 @media (max-width:420px){.tabs button{font-size:15px;padding:9px 2px}.tabs .count{font-size:12px;margin-left:3px}table.stats th,table.stats td{padding:9px 6px}}
 
@@ -364,7 +381,9 @@ function status(g) {
   return 'pending';
 }
 const scoreOf = (g, teamId) => g.score && g.score[teamId] != null ? g.score[teamId] : null;
-const teamName = t => t ? (t.shortName || t.name) : 'TBA';
+// Some Spordle short names are only the division ("U13 A1"); show the full name for those.
+const usefulShort = s => s && !(/^\s*(U\d+|\d+U)\b[\s\w-]*$/i.test(s) && !/[a-z]{4,}/i.test(s)) ? s : null;
+const teamName = t => t ? (usefulShort(t.shortName) || t.name) : 'TBA';
 function resultFor(g, teamId) {
   const me = scoreOf(g, teamId), opp = scoreOf(g, teamId === g.homeTeamId ? g.awayTeamId : g.homeTeamId);
   if (me == null || opp == null) return null;
@@ -507,11 +526,12 @@ function filtered() {
 /* ---------- render ---------- */
 function render() {
   document.querySelectorAll('.tabs button').forEach(b => b.setAttribute('aria-selected', String(b.dataset.tab === S.tab)));
-  // A "#game/<id>" address shows this app's own game page instead of the lists.
-  const gid = gameFromHash();
-  document.body.classList.toggle('detail', !!gid);
+  // A "#game/<id>" or "#player/<id>" address shows a page of its own instead of the lists.
+  const gid = gameFromHash(), pid = playerFromHash();
+  document.body.classList.toggle('detail', !!(gid || pid));
   $('#updated').textContent = S.loadedAt ? `Updated ${shortDate(S.loadedAt)}, ${timeStr(S.loadedAt)}` : '';
   if (gid) return renderDetail(gid);
+  if (pid) return renderPlayer(pid);
   document.title = BASE_TITLE;
   const games = filtered();
   const upcoming = games.filter(g => { const s = status(g); return s === 'upcoming' || s === 'live' || (s === 'cancelled' && new Date(g.startTime) > new Date()); });
@@ -817,13 +837,144 @@ function renderStats() {
       } }, c.l)));
   const body = rows.slice(0, S.shown).map((r, i) => el('tr', { class: r.team === tid ? 'me' : '' },
     el('td', { class: 'rk' }, String(i + 1)),
-    el('td', { class: 't' }, el('span', { class: 'pn' }, nameCase(r.name), r.num != null ? el('small', {}, '#' + r.num) : ''),
+    el('td', { class: 't' }, el('a', { class: 'pn', href: '#player/' + r.id }, nameCase(r.name), r.num != null ? el('small', {}, '#' + r.num) : ''),
       el('span', { class: 'tm', title: (d.teams[r.team] || [])[0] || '' }, teamOf(r.team))),
     ...cols.map(c => el('td', { class: c.k === sort.k ? 'sorted' : '' }, c.fmt ? c.fmt(r[c.k]) : n(r[c.k])))));
   return el('div', {}, bar,
     el('div', { class: 'tablewrap' }, el('table', { class: 'stats' }, el('thead', {}, head), el('tbody', {}, ...body))),
     rows.length > S.shown ? el('button', { class: 'btn more', onclick: () => { S.shown += PAGE_SIZE; render(); } }, `Show more (${rows.length - S.shown} left)`) : '',
     note);
+}
+
+/* ---------- player page: #player/<id> (stats/players/<id % 1024>.json, built by scripts/collect_stats.py) ---------- */
+// Spordle uses one id per player across seasons and leagues, so this is a whole career.
+const PLAYER_SHARDS = 1024;
+const PLAYERS = {}; // shard number -> { loading } | { data } | { error }
+const playerFromHash = () => { const m = location.hash.match(/^#player\/(\d+)$/); return m ? Number(m[1]) : null; };
+const LEAGUE_NAME = k => (LEAGUES.find(l => l.key === k) || {}).name || k;
+
+async function loadPlayerShard(n) {
+  PLAYERS[n] = { loading: true };
+  try {
+    const r = await fetch(`stats/players/${n}.json`, { cache: 'no-cache' });
+    if (!r.ok) throw new Error(r.status === 404 ? 'Player stats haven’t been built yet.' : 'HTTP ' + r.status);
+    PLAYERS[n] = { data: await r.json() };
+  } catch (e) { PLAYERS[n] = { error: e.message || String(e) }; }
+  const pid = playerFromHash();
+  if (pid != null && pid % PLAYER_SHARDS === n) render();
+}
+
+// Row layouts written by the collector:
+//   skater season [league, season, division, stage, team, num, gp, g, a, pts, pim]
+//   goalie season [league, season, division, stage, team, num, gp, w, l, t, ga, min, so]
+//   skater game   [gameId, start, league, season, stage, team, opp, home, teamScore, oppScore, g, a, pim]
+//   goalie game   [gameId, start, league, season, stage, team, opp, home, teamScore, oppScore, ga, min, result]
+const P_SK = { gp: 6, g: 7, a: 8, pts: 9, pim: 10 };
+const P_GO = { gp: 6, w: 7, l: 8, t: 9, ga: 10, min: 11, so: 12 };
+const seasonKey = r => r[0] + '|' + r[1];
+
+function sumRows(rows, idx) {
+  const out = Object.fromEntries(Object.keys(idx).map(k => [k, 0]));
+  for (const r of rows) for (const [k, i] of Object.entries(idx)) out[k] += r[i] || 0;
+  return out;
+}
+
+function renderPlayer(pid) {
+  const list = $('#list');
+  const back = el('div', { class: 'backbar' }, el('button', { class: 'back', html: ICON_BACK + '<span>Back</span>', onclick: backToList }));
+  const n = pid % PLAYER_SHARDS, st = PLAYERS[n];
+  if (!st || st.loading) { if (!st) loadPlayerShard(n); return list.replaceChildren(back, el('div', { class: 'skel' })); }
+  if (st.error) return list.replaceChildren(back, el('div', { class: 'empty' }, st.error));
+  const teams = st.data.teams || {}, p = (st.data.players || {})[pid];
+  if (!p) return list.replaceChildren(back, el('div', { class: 'empty' }, 'Couldn’t find that player.'));
+  const teamName = id => teams[id] || '—';
+
+  // page state survives re-renders but resets for a different player
+  if (!S.pv || S.pv.pid !== pid) S.pv = { pid, stage: 'all', season: null, mode: null };
+  const pv = S.pv;
+  const name = nameCase(p.name);
+  document.title = `${name} · ${BASE_TITLE}`;
+
+  const hasSk = p.skater.length > 0, hasGo = p.goalie.length > 0;
+  if (!pv.mode) pv.mode = hasGo && (!hasSk || sumRows(p.goalie, { gp: 6 }).gp >= sumRows(p.skater, { gp: 6 }).gp) ? 'goalie' : 'skater';
+  const goalie = pv.mode === 'goalie';
+  const seasonRows = goalie ? p.goalie : p.skater, games = goalie ? p.glog : p.log, idx = goalie ? P_GO : P_SK;
+
+  // stage filter (All games / League / Playoffs ...)
+  const stages = [...new Set(seasonRows.map(r => r[3] || 'Other'))].sort();
+  if (pv.stage !== 'all' && !stages.includes(pv.stage)) pv.stage = 'all';
+  const inStage = st => pv.stage === 'all' || (st || 'Other') === pv.stage;
+  const rows = seasonRows.filter(r => inStage(r[3]));
+
+  // header: latest team and number
+  const latest = [...p.skater, ...p.goalie].sort((a, b) => (b[1] + b[0]).localeCompare(a[1] + a[0]))[0];
+  const head = el('section', { class: 'section phead' },
+    latest && latest[5] != null ? el('div', { class: 'jersey' }, '#' + latest[5]) : '',
+    el('div', {}, el('div', { class: 'pname' }, name),
+      el('div', { class: 'psub' }, latest ? [teamName(latest[4]), latest[2], `${LEAGUE_NAME(latest[0])} ${latest[1]}`].filter(Boolean).join(' · ') : '')));
+
+  const controls = el('div', { class: 'statbar' },
+    hasSk && hasGo ? el('div', { class: 'seg', role: 'group', 'aria-label': 'Skater or goalie' },
+      el('button', { 'aria-pressed': String(!goalie), onclick: () => { pv.mode = 'skater'; render(); } }, 'Skater'),
+      el('button', { 'aria-pressed': String(goalie), onclick: () => { pv.mode = 'goalie'; render(); } }, 'Goalie')) : '',
+    stages.length > 1 ? (() => {
+      const sel = el('select', { 'aria-label': 'Games', onchange: e => { pv.stage = e.target.value; render(); } },
+        el('option', { value: 'all' }, 'All games'), ...stages.map(x => el('option', { value: x }, x)));
+      sel.value = pv.stage; return sel;
+    })() : '');
+
+  // career tiles
+  const tot = sumRows(rows, idx);
+  const tiles = goalie
+    ? [['GP', tot.gp], ['W', tot.w], ['L', tot.l], ['T', tot.t], ['GAA', tot.gp ? (tot.ga / tot.gp).toFixed(2) : '—', 1], ['SO', tot.so]]
+    : [['GP', tot.gp], ['G', tot.g], ['A', tot.a], ['PTS', tot.pts, 1], ['PIM', tot.pim]];
+  const seasonsPlayed = new Set(rows.map(seasonKey)).size;
+  const career = el('section', { class: 'section' },
+    el('h2', {}, seasonsPlayed > 1 ? `Career · ${seasonsPlayed} seasons` : 'Totals'),
+    el('div', { class: 'tiles' }, ...tiles.map(([l, v, hi]) => el('div', { class: 'tile' + (hi ? ' hi' : '') }, el('b', {}, String(v)), el('span', {}, l)))));
+
+  // one line per season + team, newest first; tap a line to see its games
+  const bySeason = new Map();
+  for (const r of rows) {
+    const k = seasonKey(r) + '|' + r[4];
+    if (!bySeason.has(k)) bySeason.set(k, { league: r[0], season: r[1], div: r[2], team: r[4], rows: [] });
+    bySeason.get(k).rows.push(r);
+  }
+  const seasons = [...bySeason.values()].sort((a, b) => b.season.localeCompare(a.season) || a.league.localeCompare(b.league));
+  const seasonIds = [...new Set(seasons.map(x => x.league + '|' + x.season))];
+  if (!seasonIds.includes(pv.season)) pv.season = seasonIds[0] || null;
+  const cols = goalie ? ['GP', 'W', 'L', 'T', 'GA', 'GAA', 'SO'] : ['GP', 'G', 'A', 'PTS', 'PIM'];
+  const lineVals = t => goalie ? [t.gp, t.w, t.l, t.t, t.ga, t.gp ? (t.ga / t.gp).toFixed(2) : '—', t.so] : [t.gp, t.g, t.a, t.pts, t.pim];
+  const seasonTable = el('div', { class: 'tablewrap' }, el('table', { class: 'stats plog' },
+    el('thead', {}, el('tr', {}, el('th', { class: 't' }, 'Season'), ...cols.map(c => el('th', {}, c)))),
+    el('tbody', {}, ...seasons.map(x => {
+      const key = x.league + '|' + x.season;
+      return el('tr', { class: 'go' + (key === pv.season ? ' sel' : ''), title: 'Show these games', onclick: () => { pv.season = key; render(); } },
+        el('td', { class: 't' }, el('span', { class: 'pn' }, x.season), el('span', { class: 'tm' }, [teamName(x.team), x.div, LEAGUE_NAME(x.league)].filter(Boolean).join(' · '))),
+        ...lineVals(sumRows(x.rows, idx)).map(v => el('td', {}, String(v))));
+    }))));
+
+  // game log for the picked season
+  const [lgKey, seasonId] = (pv.season || '|').split('|');
+  const log = games.filter(g => g[2] === lgKey && g[3] === seasonId && inStage(g[4])).slice().reverse();
+  const gcols = goalie ? ['GA', 'MIN'] : ['G', 'A', 'PTS', 'PIM'];
+  const logTable = log.length ? el('div', { class: 'tablewrap' }, el('table', { class: 'stats plog' },
+    el('thead', {}, el('tr', {}, el('th', { class: 't' }, 'Game'), el('th', {}, 'Result'), ...gcols.map(c => el('th', {}, c)))),
+    el('tbody', {}, ...log.map(g => {
+      const ts = g[8], os = g[9], res = ts == null || os == null ? null : ts > os ? 'W' : ts < os ? 'L' : 'T';
+      const line = goalie ? [g[10], g[11] != null ? Math.round(g[11]) : '—'] : [g[10], g[11], g[10] + g[11], g[12]];
+      const d = new Date(g[1]);
+      return el('tr', { class: 'go', title: 'Game details', onclick: () => { location.hash = 'game/' + g[0]; } },
+        el('td', { class: 't' }, el('span', { class: 'pn' }, `${g[7] ? 'vs' : '@'} ${teamName(g[6])}`),
+          el('span', { class: 'tm' }, `${fmt(d, { weekday: 'short', month: 'short', day: 'numeric' })} · ${g[4] || ''}`)),
+        el('td', { class: 'res ' + (res || '') }, res ? `${res} ${ts}–${os}` : '—'),
+        ...line.map(v => el('td', {}, String(v ?? 0))));
+    })))) : el('div', { class: 'empty' }, 'No games for this selection.');
+
+  list.replaceChildren(back, head, controls, career,
+    el('div', { class: 'sched-h' }, 'By season'), seasonTable,
+    el('div', { class: 'sched-h' }, seasonId ? `${seasonId} games` : 'Games'), logTable,
+    el('div', { class: 'statnote' }, 'From Spordle game sheets. Goals the scorekeeper marked “Unknown” aren’t credited to anyone.'));
 }
 
 /* ---------- game page (this app's own, replaces the Spordle link) ---------- */
@@ -967,10 +1118,11 @@ function renderDetail(id) {
   list.replaceChildren(back, ...sections);
 }
 
-// Moving between the lists and a game page keeps your place in the list.
-let lastGid = gameFromHash();
+// Moving between the lists and a game or player page keeps your place in the list.
+const detailRoute = () => (location.hash.match(/^#(game|player)\/\d+$/) || [null])[0];
+let lastGid = detailRoute();
 function onRoute() {
-  const gid = gameFromHash();
+  const gid = detailRoute();
   if (gid && !lastGid) { S.listScroll = window.scrollY; S.cameFromList = true; }
   if (!gid) S.cameFromList = false;
   render();
