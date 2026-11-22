@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS categories (id TEXT PRIMARY KEY, league TEXT, name TE
 def open_db(path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     db = sqlite3.connect(path)
+    db.execute('PRAGMA busy_timeout = 30000')  # wait if another run is writing
     db.executescript(SCHEMA)
     return db
 
@@ -296,8 +297,18 @@ def export_league(db, lg, season, out_dir, current=False):
         FROM goalie_games gg JOIN games g ON g.id = gg.game_id JOIN players p ON p.id = gg.player_id
         WHERE g.league=? AND g.season=?
         GROUP BY gg.player_id, gg.team_id, g.schedule_id""", key, season)
-    team_ids = {r[3] for r in skaters} | {r[3] for r in goalies}
-    teams = {str(r[0]): [r[1], useful_short(r[1], r[2])] for r in q('SELECT id,name,short_name FROM teams') if r[0] in team_ids}
+    # team results per schedule, from final scores: [team, sched, gp, w, l, t, gf, ga]
+    records = q("""
+        SELECT team, schedule_id, COUNT(*), SUM(gf > ga), SUM(gf < ga), SUM(gf = ga), SUM(gf), SUM(ga) FROM (
+          SELECT home_team_id team, schedule_id, home_score gf, away_score ga FROM games
+            WHERE league=? AND season=? AND home_score IS NOT NULL AND away_score IS NOT NULL AND start_time < ?
+          UNION ALL
+          SELECT away_team_id, schedule_id, away_score, home_score FROM games
+            WHERE league=? AND season=? AND home_score IS NOT NULL AND away_score IS NOT NULL AND start_time < ?)
+        WHERE team IS NOT NULL GROUP BY team, schedule_id""", *([key, season, datetime.now(timezone.utc).isoformat()] * 2))
+    team_ids = {r[3] for r in skaters} | {r[3] for r in goalies} | {r[0] for r in records}
+    teams = {str(r[0]): [r[1], useful_short(r[1], r[2]), r[3]]
+             for r in q('SELECT id,name,short_name,logo_url FROM teams') if r[0] in team_ids}
     scheds = {str(r[0]): [r[1], r[2], r[3]] for r in q('SELECT id,category_id,name,type FROM schedules WHERE league=? AND season=?', key, season)}
     cat_ids = {v[0] for v in scheds.values()}
     cats = {r[0]: r[1] for r in q('SELECT id,name FROM categories WHERE league=?', key) if r[0] in cat_ids}
@@ -312,7 +323,9 @@ def export_league(db, lg, season, out_dir, current=False):
         'generatedAt': datetime.now(timezone.utc).isoformat(timespec='seconds'),
         'games': games_done[0] or 0,
         'gamesWithStats': games_done[1] or 0,
-        'teams': teams,                 # id -> [name, shortName]
+        'teams': teams,                 # id -> [name, shortName, logoUrl]
+        'recordCols': ['team', 'sched', 'gp', 'w', 'l', 't', 'gf', 'ga'],
+        'records': [list(r) for r in records],
         'schedules': scheds,            # id -> [categoryId, name, type]
         'categories': cats,             # id -> division name
         # one row per player per team per schedule; the app adds up the schedules being viewed
@@ -452,6 +465,7 @@ def main():
     ap.add_argument('--league', action='append', help='only these league keys (default: all)')
     ap.add_argument('--full', action='store_true', help='re-fetch every finished game')
     ap.add_argument('--no-players', action='store_true', help='skip writing the per-player files')
+    ap.add_argument('--export-only', action='store_true', help='rebuild the JSON files from the database without fetching')
     ap.add_argument('--players-only', action='store_true', help='only write the per-player files from the database')
     ap.add_argument('--backup-dir', help='also keep a daily snapshot of the database here')
     ap.add_argument('--season', action='append', help='season(s) to sync, e.g. 2025-26 (default: the current one)')
@@ -468,7 +482,7 @@ def main():
         try:
             cur = current_season(lg)
             for season in args.season or [cur]:
-                errors = sync_league(db, lg, season, args.full)
+                errors = 0 if args.export_only else sync_league(db, lg, season, args.full)
                 export_league(db, lg, season, args.out, current=season == cur)
                 failed |= errors > 0
             if args.season and cur not in args.season:
@@ -482,7 +496,7 @@ def main():
         except Exception as e:
             log('players export FAILED -', e)
             failed = True
-    if args.backup_dir:
+    if args.backup_dir and not args.export_only:
         try:
             backup(db, args.backup_dir)
         except Exception as e:
