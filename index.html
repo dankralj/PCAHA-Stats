@@ -154,6 +154,27 @@ tr.me td.t{font-weight:700;color:var(--accent)}
 tbody tr{cursor:pointer}
 tbody tr:hover td{background:var(--surface-2)}
 
+/* ---------- player & goalie stats ---------- */
+.statbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 10px}
+.seg{display:inline-flex;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:3px}
+.seg button{border:0;background:transparent;padding:7px 14px;border-radius:9px;font-weight:600;cursor:pointer;color:var(--muted)}
+.seg button[aria-pressed="true"]{background:var(--surface-2);color:var(--text)}
+.chip{border:1px solid var(--line);background:var(--surface);border-radius:999px;padding:7px 12px;font-weight:600;font-size:13px;cursor:pointer;color:var(--muted)}
+.chip[aria-pressed="true"]{border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}
+table.stats th.sortable{cursor:pointer;user-select:none}
+table.stats th.sortable:hover{color:var(--text)}
+table.stats th[aria-sort]{color:var(--accent)}
+table.stats th[aria-sort="descending"]::after{content:" ▾"}
+table.stats th[aria-sort="ascending"]::after{content:" ▴"}
+table.stats tbody tr{cursor:default}
+table.stats td.t{min-width:140px}
+table.stats .pn{font-weight:600}
+table.stats .pn small{color:var(--muted);font-weight:500;margin-left:4px}
+table.stats .tm{display:block;font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px}
+table.stats td.sorted{font-weight:700;color:var(--accent)}
+.statnote{font-size:12px;color:var(--muted);text-align:center;margin:-4px 8px 16px}
+@media (max-width:420px){.tabs button{font-size:15px;padding:9px 2px}.tabs .count{font-size:12px;margin-left:3px}table.stats th,table.stats td{padding:9px 6px}}
+
 /* ---------- misc ---------- */
 .empty,.error{text-align:center;color:var(--muted);padding:40px 16px}
 .error{color:var(--loss)}
@@ -222,13 +243,14 @@ body.detail .controls,body.detail .tabs,body.detail #summary{display:none}
     <div class="field"><label for="cat">Division</label><select id="cat"></select></div>
     <div class="field"><label for="sch">Schedule</label><select id="sch"></select></div>
     <div class="field team"><label for="team">My team</label><select id="team"><option value="">All teams</option></select></div>
-    <div class="field full search"><label for="q">Search</label><input id="q" type="search" placeholder="Team, arena or game #" autocomplete="off"></div>
+    <div class="field full search"><label for="q">Search</label><input id="q" type="search" placeholder="Team, player, arena or game #" autocomplete="off"></div>
   </div>
 
   <div class="tabs" role="tablist">
     <button role="tab" data-tab="results" aria-selected="true">Results<span class="count" id="c-results"></span></button>
     <button role="tab" data-tab="upcoming" aria-selected="false">Upcoming<span class="count" id="c-upcoming"></span></button>
     <button role="tab" data-tab="standings" aria-selected="false">Standings</button>
+    <button role="tab" data-tab="stats" aria-selected="false">Stats</button>
   </div>
 
   <div id="summary"></div>
@@ -501,6 +523,7 @@ function render() {
 
   const list = $('#list');
   if (S.tab === 'standings') return list.replaceChildren(renderStandings());
+  if (S.tab === 'stats') return list.replaceChildren(renderStats());
   const src = S.tab === 'upcoming' ? upcoming : results;
   if (!src.length) return list.replaceChildren(el('div', { class: 'empty' },
     S.tab === 'upcoming' ? 'No upcoming games scheduled yet.' : 'No games played yet.'));
@@ -624,6 +647,119 @@ function renderStandings() {
   return frag;
 }
 const n = v => v == null ? '0' : String(v);
+
+/* ---------- player & goalie stats (stats/stats-<league>.json, built by scripts/collect_stats.py) ---------- */
+// Each row in the file is one player, on one team, in one schedule; the rows for the
+// schedules being viewed (Division + Schedule pickers) are added up here.
+const STATS = {}; // league key -> { loading } | { data } | { error }
+const STAT_COLS = {
+  skaters: [{ k: 'gp', l: 'GP', t: 'Games played' }, { k: 'g', l: 'G', t: 'Goals' }, { k: 'a', l: 'A', t: 'Assists' },
+    { k: 'pts', l: 'PTS', t: 'Points' }, { k: 'pim', l: 'PIM', t: 'Penalty minutes' }],
+  goalies: [{ k: 'gp', l: 'GP', t: 'Games played' }, { k: 'w', l: 'W', t: 'Wins' }, { k: 'l', l: 'L', t: 'Losses' },
+    { k: 't', l: 'T', t: 'Ties' }, { k: 'ga', l: 'GA', t: 'Goals against' },
+    { k: 'gaa', l: 'GAA', t: 'Goals against per game played', asc: true, fmt: v => v == null ? '—' : v.toFixed(2) },
+    { k: 'so', l: 'SO', t: 'Shutouts' }],
+};
+// Ties are broken by these, in order (negative = fewer is better).
+const STAT_TIEBREAK = { skaters: ['pts', 'g', '-gp'], goalies: ['w', '-gaa', 'gp'] };
+S.statMode = store.get('statMode', 'skaters') === 'goalies' ? 'goalies' : 'skaters';
+S.statSort = store.get('statSort', { skaters: { k: 'pts', dir: -1 }, goalies: { k: 'w', dir: -1 } });
+S.statMine = store.get('statMine', false);
+
+async function loadStats() {
+  const key = S.league;
+  STATS[key] = { loading: true };
+  try {
+    const r = await fetch(`stats/stats-${key}.json`, { cache: 'no-cache' });
+    if (!r.ok) throw new Error(r.status === 404 ? 'No player stats have been collected for this league yet.' : 'HTTP ' + r.status);
+    STATS[key] = { data: await r.json() };
+  } catch (e) { STATS[key] = { error: e.message || String(e) }; }
+  if (S.tab === 'stats' && S.league === key) render();
+}
+
+// "KAI STAVEN" -> "Kai Staven", "DUNCAN MCINNES" -> "Duncan McInnes"
+const nameCase = s => String(s || '').toLowerCase().replace(/(^|[\s'-])(\p{L})/gu, (_, a, b) => a + b.toUpperCase())
+  .replace(/\bMc(\p{L})/gu, (_, c) => 'Mc' + c.toUpperCase());
+
+function statRows(d, mode) {
+  const cols = d[mode === 'goalies' ? 'goalieCols' : 'skaterCols'], ix = Object.fromEntries(cols.map((c, i) => [c, i]));
+  const numCols = cols.slice(ix.gp);
+  const scheds = new Set((S.scheduleId === 'all' ? schedulesForCategory().map(s => s.id) : [S.scheduleId]).map(String));
+  const agg = new Map();
+  for (const r of d[mode] || []) {
+    if (!scheds.has(String(r[ix.sched]))) continue;
+    const key = r[ix.id] + ':' + r[ix.team];
+    let a = agg.get(key);
+    if (!a) agg.set(key, a = { id: r[ix.id], name: r[ix.name], num: r[ix.num], team: r[ix.team], ...Object.fromEntries(numCols.map(c => [c, 0])) });
+    for (const c of numCols) a[c] += r[ix[c]] || 0;
+    if (r[ix.num] != null) a.num = r[ix.num];
+  }
+  const rows = [...agg.values()];
+  if (mode === 'goalies') for (const r of rows) r.gaa = r.gp ? r.ga / r.gp : null;
+  return rows;
+}
+
+function sortStats(rows, mode) {
+  const { k, dir } = S.statSort[mode];
+  const keys = [(dir < 0 ? '' : '-') + k, ...STAT_TIEBREAK[mode]];
+  const val = (r, c) => r[c] == null ? -Infinity : r[c];
+  return rows.sort((a, b) => {
+    for (const key of keys) {
+      const neg = key.startsWith('-'), c = neg ? key.slice(1) : key;
+      const diff = val(b, c) - val(a, c);
+      if (diff) return neg ? -diff : diff;
+    }
+    return String(a.name).localeCompare(String(b.name));
+  });
+}
+
+function renderStats() {
+  const st = STATS[S.league];
+  if (!st) { loadStats(); return el('div', { class: 'skel' }); }
+  if (st.loading) return el('div', { class: 'skel' });
+  if (st.error) return el('div', { class: 'empty' }, st.error);
+  const d = st.data, mode = S.statMode, tid = Number($('#team').value) || null;
+  const teamOf = id => { const t = d.teams[id]; return t ? (t[1] || t[0]) : ''; };
+  const q = S.q.trim().toLowerCase();
+  let rows = statRows(d, mode);
+  if (S.statMine && tid) rows = rows.filter(r => r.team === tid);
+  if (q) rows = rows.filter(r => [r.name, teamOf(r.team), (d.teams[r.team] || [])[0], r.num].some(x => x != null && String(x).toLowerCase().includes(q)));
+  rows = sortStats(rows, mode);
+
+  const cols = STAT_COLS[mode], sort = S.statSort[mode];
+  const setMode = m => { S.statMode = m; store.set('statMode', m); S.shown = PAGE_SIZE; render(); };
+  const bar = el('div', { class: 'statbar' },
+    el('div', { class: 'seg', role: 'group', 'aria-label': 'Players or goalies' },
+      el('button', { 'aria-pressed': String(mode === 'skaters'), onclick: () => setMode('skaters') }, 'Players'),
+      el('button', { 'aria-pressed': String(mode === 'goalies'), onclick: () => setMode('goalies') }, 'Goalies')),
+    tid ? el('button', { class: 'chip', 'aria-pressed': String(!!S.statMine),
+      onclick: () => { S.statMine = !S.statMine; store.set('statMine', S.statMine); S.shown = PAGE_SIZE; render(); } }, 'My team only') : '');
+
+  const updated = d.generatedAt ? new Date(d.generatedAt) : null;
+  const note = el('div', { class: 'statnote' },
+    `From ${d.gamesWithStats} game sheets${updated ? ` · updated ${shortDate(updated)}, ${timeStr(updated)}` : ''}. ` +
+    'Goals the scorekeeper marked “Unknown” aren’t credited to anyone.');
+  if (!rows.length) return el('div', {}, bar, el('div', { class: 'empty' },
+    q ? 'No players match your search.' : mode === 'goalies' ? 'No goalie stats for this division yet.' : 'No player stats for this division yet.'), note);
+
+  const head = el('tr', {}, el('th', {}, '#'), el('th', { class: 't' }, mode === 'goalies' ? 'Goalie' : 'Player'),
+    ...cols.map(c => el('th', { class: 'sortable', title: c.t, 'aria-sort': sort.k === c.k ? (sort.dir < 0 ? 'descending' : 'ascending') : null,
+      onclick: () => {
+        // first tap sorts best-first (most points, lowest GAA); tapping again flips it
+        const best = c.asc ? 1 : -1;
+        S.statSort[mode] = { k: c.k, dir: sort.k === c.k ? -sort.dir : best };
+        store.set('statSort', S.statSort); render();
+      } }, c.l)));
+  const body = rows.slice(0, S.shown).map((r, i) => el('tr', { class: r.team === tid ? 'me' : '' },
+    el('td', { class: 'rk' }, String(i + 1)),
+    el('td', { class: 't' }, el('span', { class: 'pn' }, nameCase(r.name), r.num != null ? el('small', {}, '#' + r.num) : ''),
+      el('span', { class: 'tm', title: (d.teams[r.team] || [])[0] || '' }, teamOf(r.team))),
+    ...cols.map(c => el('td', { class: c.k === sort.k ? 'sorted' : '' }, c.fmt ? c.fmt(r[c.k]) : n(r[c.k])))));
+  return el('div', {}, bar,
+    el('div', { class: 'tablewrap' }, el('table', { class: 'stats' }, el('thead', {}, head), el('tbody', {}, ...body))),
+    rows.length > S.shown ? el('button', { class: 'btn more', onclick: () => { S.shown += PAGE_SIZE; render(); } }, `Show more (${rows.length - S.shown} left)`) : '',
+    note);
+}
 
 /* ---------- game page (this app's own, replaces the Spordle link) ---------- */
 const BASE_TITLE = document.title;
@@ -795,7 +931,7 @@ $('#cat').addEventListener('change', e => { S.categoryId = e.target.value; pref.
 $('#sch').addEventListener('change', e => { S.scheduleId = e.target.value; pref.set('scheduleId', S.scheduleId); loadGames(); });
 $('#team').addEventListener('change', () => { onTeam(); render(); });
 $('#q').addEventListener('input', e => { S.q = e.target.value; S.shown = PAGE_SIZE; render(); });
-$('#refresh').addEventListener('click', () => (S.schedules.length ? loadGames() : boot()));
+$('#refresh').addEventListener('click', () => { delete STATS[S.league]; return S.schedules.length ? loadGames() : boot(); });
 document.querySelectorAll('.tabs button').forEach(b => b.addEventListener('click', () => { S.tab = b.dataset.tab; store.set('tab', S.tab); S.shown = PAGE_SIZE; render(); }));
 
 // Dark is the default; tap the footer link to cycle dark → light → auto (follows the phone's setting).
